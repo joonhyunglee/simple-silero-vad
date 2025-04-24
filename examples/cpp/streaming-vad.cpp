@@ -109,16 +109,6 @@ private:
     }
 };
 
-// 클래스 외부에 save_probability_data 함수 정의
-void save_probability_data(const std::vector<float>& probs, int window_size_samples, int sample_rate) {
-    std::ofstream file("probability.txt");
-    for (size_t i = 0; i < probs.size(); i++) {
-        double time = static_cast<double>(i * window_size_samples) / sample_rate;
-        file << time << " " << probs[i] << "\n";
-    }
-    file.close();
-}
-
 // VadIterator class: uses ONNX Runtime to detect speech segments.
 class VadIterator {
 public:
@@ -252,10 +242,10 @@ public:
 
         // If speech is detected (probability >= threshold)
         if (speech_prob >= threshold) {
-#ifdef __DEBUG_SPEECH_PROB___
+            #ifdef __DEBUG_SPEECH_PROB___
             float speech = current_sample - window_size_samples;
             printf("{ start: %.3f s (%.3f) %08d}\n", 1.0f * speech / sample_rate, speech_prob, current_sample - window_size_samples);
-#endif
+            #endif
             if (temp_end != 0) {
                 temp_end = 0;
                 if (next_start < prev_end)
@@ -304,10 +294,10 @@ public:
         }
 
         if (speech_prob < (threshold - 0.15)) {
-#ifdef __DEBUG_SPEECH_PROB___
+            #ifdef __DEBUG_SPEECH_PROB___
             float speech = current_sample - window_size_samples - speech_pad_samples;
             printf("{ end: %.3f s (%.3f) %08d}\n", 1.0f * speech / sample_rate, speech_prob, current_sample - window_size_samples);
-#endif
+            #endif
             if (triggered) {
                 if (temp_end == 0)
                     temp_end = current_sample;
@@ -330,10 +320,6 @@ public:
         }
     }
 
-    // void init_onnx_model(const std::wstring& model_path) {
-    //     init_engine_threads(1, 1);
-    //     session = std::make_shared<Ort::Session>(env, model_path.c_str(), session_options);
-    // }
     void init_onnx_model(const std::string& model_path) {
         init_engine_threads(1, 1);
         session = std::make_shared<Ort::Session>(env, model_path.c_str(), session_options);
@@ -392,77 +378,6 @@ private:
     std::vector<float> speech_probs;  // probability 저장용 벡터 추가
 };
 
-void save_waveform_data(const std::vector<float>& audio_data, int sample_rate) {
-    std::ofstream file("waveform.txt");
-    for (size_t i = 0; i < audio_data.size(); i++) {
-        double time = static_cast<double>(i) / sample_rate;
-        file << time << " " << audio_data[i] << "\n";
-    }
-    file.close();
-}
-
-void save_vad_segments(const std::vector<timestamp_t>& stamps, int sample_rate) {
-    std::ofstream file("vad_segments.txt");
-    for (const auto& stamp : stamps) {
-        double start_time = static_cast<double>(stamp.start) / sample_rate;
-        double end_time = static_cast<double>(stamp.end) / sample_rate;
-        // VAD 구간을 박스로 그리기 위해 y값 범위 설정
-        file << start_time << " -1\n";
-        file << start_time << " 1\n";
-        file << end_time << " 1\n";
-        file << end_time << " -1\n";
-        file << start_time << " -1\n\n"; // 빈 줄로 구간 구분
-    }
-    file.close();
-}
-
-// Gnuplot 스크립트 수정
-void create_gnuplot_script(float threshold) {
-    std::ofstream script("plot.gnu");
-    script << "set terminal png size 1200,900\n";  // 세로 크기 증가
-    script << "set output 'vad_visualization.png'\n";
-    script << "set multiplot layout 2,1\n";  // 2개의 그래프를 위한 레이아웃
-    
-    // 첫 번째 그래프: 오디오 파형과 VAD 구간
-    script << "set title 'Audio Waveform with VAD Segments'\n";
-    script << "set xlabel 'Time (seconds)'\n";
-    script << "set ylabel 'Amplitude'\n";
-    script << "set grid\n";
-    script << "set style fill transparent solid 0.2\n";
-    script << "plot 'waveform.txt' using 1:2 with lines title 'Audio' lt rgb 'blue',\\\n";
-    script << "     'vad_segments.txt' using 1:2 with filledcurves title 'VAD segments' lt rgb 'red'\n";
-    
-    // 두 번째 그래프: Speech Probability
-    script << "set title 'Speech Probability Over Time'\n";
-    script << "set xlabel 'Time (seconds)'\n";
-    script << "set ylabel 'Probability'\n";
-    script << "set yrange [0:1]\n";  // probability는 0~1 사이
-    script << "set grid\n";
-    script << "plot 'probability.txt' using 1:2 with lines title 'Speech Probability' lt rgb 'green',\\\n";
-    script << "     " << threshold << " with lines title 'Threshold' lt rgb 'red' dashtype 2\n";  // threshold 선 추가
-    
-    script << "unset multiplot\n";
-    script.close();
-}
-
-// visualize_vad_results 함수 수정
-void visualize_vad_results(const std::vector<float>& audio_data,
-                          const std::vector<timestamp_t>& stamps,
-                          const std::vector<float>& probs,
-                          int window_size_samples,
-                          int sample_rate,
-                          float threshold) {
-    save_waveform_data(audio_data, sample_rate);
-    save_vad_segments(stamps, sample_rate);
-    save_probability_data(probs, window_size_samples, sample_rate);
-    
-    create_gnuplot_script(threshold);
-    system("gnuplot plot.gnu");
-    
-    std::cout << "Visualization saved as 'vad_visualization.png'" << std::endl;
-}
-
-// StreamData 구조체에 뮤텍스 추가
 struct StreamData {
     VadIterator* vad;
     std::vector<float> buffer;
@@ -657,8 +572,6 @@ int main() {
     inputParameters.sampleFormat = paFloat32;
     inputParameters.suggestedLatency = deviceInfo->defaultLowInputLatency;
     inputParameters.hostApiSpecificStreamInfo = nullptr;
-    
-    // stream 변수 선언 추가
     PaStream* stream = nullptr;
     
     err = Pa_OpenStream(&stream,
@@ -684,22 +597,18 @@ int main() {
         Pa_Terminate();
         return 1;
     }
-    
     std::cout << "실시간 VAD 시작... 'q'를 누르면 종료됩니다." << std::endl;
     
     // 메인 루프 수정
     while (true) {
         updateDisplay(&data);  // 메인 스레드에서 디스플레이 업데이트
-        
         char key = cv::waitKey(30);
         if (key == 'q' || key == 'Q') {
             break;
         }
-        
         if (cv::getWindowProperty("Real-time VAD", cv::WND_PROP_VISIBLE) < 1) {
             break;
         }
-        
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     

@@ -52,18 +52,30 @@ class WavReader {
   explicit WavReader(const std::string& filename) { Open(filename); }
 
   bool Open(const std::string& filename) {
-    FILE* fp = fopen(filename.c_str(), "rb"); //文件读取
+    std::cout << "Opening file: " << filename << std::endl;
+    FILE* fp = fopen(filename.c_str(), "rb");
     if (NULL == fp) {
-      std::cout << "Error in read " << filename;
-      return false;
+        std::cout << "Error opening file: " << filename << std::endl;
+        std::cout << "Error details: " << strerror(errno) << std::endl;
+        return false;
     }
+    std::cout << "File opened successfully" << std::endl;
 
     WavHeader header;
-    fread(&header, 1, sizeof(header), fp);
+    size_t read_size = fread(&header, 1, sizeof(header), fp);
+    std::cout << "Read header size: " << read_size << " bytes" << std::endl;
+    
+    // Print header information for debugging
+    std::cout << "Header info:" << std::endl;
+    std::cout << "RIFF: " << std::string(header.riff, 4) << std::endl;
+    std::cout << "Size: " << header.size << std::endl;
+    std::cout << "WAVE: " << std::string(header.wav, 4) << std::endl;
+    std::cout << "fmt_size: " << header.fmt_size << std::endl;
+    
     if (header.fmt_size < 16) {
-      printf("WaveData: expect PCM format data "
-              "to have fmt chunk of at least size 16.\n");
-      return false;
+        printf("WaveData: expect PCM format data to have fmt chunk of at least size 16.\n");
+        fclose(fp);
+        return false;
     } else if (header.fmt_size > 16) {
       int offset = 44 - 8 + header.fmt_size - 16;
       fseek(fp, offset, SEEK_SET);

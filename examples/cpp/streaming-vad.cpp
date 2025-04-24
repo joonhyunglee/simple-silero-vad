@@ -1,18 +1,17 @@
 /*
-g++ silero-vad-onnx.cpp \
+g++ streaming-vad.cpp \
     -std=c++17 \
     -I /opt/homebrew/Cellar/onnxruntime/1.21.0/include \
     -L /opt/homebrew/Cellar/onnxruntime/1.21.0/lib \
     -I /opt/homebrew/include \
     -L /opt/homebrew/lib \
     -lonnxruntime \
-    -lboost_iostreams \
-    -lboost_system \
-    -lboost_filesystem \
+    -lportaudio \
+    `pkg-config --cflags --libs opencv4` \
+    -pthread \
     -Wl,-rpath,/opt/homebrew/Cellar/onnxruntime/1.21.0/lib \
-    -o test
-
-./test
+    -o streaming-vad
+./streaming-vad
 
 // Visualize
 brew install gnuplot
@@ -50,9 +49,13 @@ curl -O https://raw.githubusercontent.com/dstahlke/gnuplot-iostream/master/gnupl
 #include "wav.h" // For reading WAV files
 // Visualize
 #include "gnuplot-iostream.h"
-
+// PortAudio (Audio Input/Output)
+#include <portaudio.h>
 #include <fstream>
 #include <cstdlib>
+#include <opencv2/opencv.hpp>
+#include <mutex>
+#include <thread>
 
 // timestamp_t class: stores the start and end (in samples) of a speech segment.
 class timestamp_t {
@@ -168,7 +171,7 @@ public:
     // Constructor
     VadIterator(const std::string ModelPath,
         int Sample_rate = 16000, int windows_frame_size = 32,
-        float Threshold = 0.8, int min_silence_duration_ms = 100,
+        float Threshold = 0.75, int min_silence_duration_ms = 100,
         int speech_pad_ms = 30, int min_speech_duration_ms = 250,
         float max_speech_duration_s = std::numeric_limits<float>::infinity())
         : sample_rate(Sample_rate), 
@@ -293,7 +296,7 @@ public:
             std::copy(new_data.end() - context_samples, new_data.end(), _context.begin());
             return;
         }
-
+        
         if ((speech_prob >= (threshold - 0.15)) && (speech_prob < threshold)) {
             // When the speech probability temporarily drops but is still in speech, update context without changing state.
             std::copy(new_data.end() - context_samples, new_data.end(), _context.begin());
@@ -459,61 +462,253 @@ void visualize_vad_results(const std::vector<float>& audio_data,
     std::cout << "Visualization saved as 'vad_visualization.png'" << std::endl;
 }
 
+// StreamData 구조체에 뮤텍스 추가
+struct StreamData {
+    VadIterator* vad;
+    std::vector<float> buffer;
+    std::vector<float> display_probs;
+    std::vector<float> display_audio;
+    float threshold;
+    cv::Mat display_mat;
+    static const int DISPLAY_WIDTH = 800;
+    static const int DISPLAY_HEIGHT = 600;
+    std::mutex mtx;  // 데이터 접근을 위한 뮤텍스 추가
+    bool should_update = false;  // 디스플레이 업데이트 필요 여부
+};
+
+// OpenCV 시각화 함수 수정
+void updateDisplay(StreamData* data) {
+    std::lock_guard<std::mutex> lock(data->mtx);  // 뮤텍스 잠금
+    
+    if (!data->should_update) return;  // 업데이트가 필요없으면 반환
+    
+    try {
+        // 디스플레이 초기화
+        data->display_mat = cv::Mat::zeros(data->DISPLAY_HEIGHT, data->DISPLAY_WIDTH, CV_8UC3);
+        
+        // 오디오 파형 그리기 (위쪽 절반)
+        int audio_height = data->DISPLAY_HEIGHT / 2;
+        int mid_line = audio_height / 2;
+        
+        // 오디오 데이터 정규화 및 그리기
+        if (!data->display_audio.empty()) {
+            float max_amp = *std::max_element(data->display_audio.begin(), data->display_audio.end(),
+                [](float a, float b) { return std::abs(a) < std::abs(b); });
+            max_amp = std::max(max_amp, 1.0f);  // 0으로 나누기 방지
+            
+            for (size_t i = 1; i < data->display_audio.size(); ++i) {
+                int x1 = (i - 1) * data->DISPLAY_WIDTH / data->display_audio.size();
+                int x2 = i * data->DISPLAY_WIDTH / data->display_audio.size();
+                int y1 = mid_line + (data->display_audio[i-1] / max_amp * (audio_height/2));
+                int y2 = mid_line + (data->display_audio[i] / max_amp * (audio_height/2));
+                
+                cv::line(data->display_mat, 
+                        cv::Point(x1, y1), 
+                        cv::Point(x2, y2),
+                        cv::Scalar(255, 255, 0),  // 청록색
+                        1);
+            }
+        }
+        
+        // VAD 확률 그리기 (아래쪽 절반)
+        int prob_height = data->DISPLAY_HEIGHT / 2;
+        int prob_offset = audio_height;
+        
+        // 임계값 선 그리기
+        int threshold_y = prob_offset + prob_height * (1 - data->threshold);
+        cv::line(data->display_mat,
+                cv::Point(0, threshold_y),
+                cv::Point(data->DISPLAY_WIDTH, threshold_y),
+                cv::Scalar(0, 0, 255),  // 빨간색
+                1);
+        
+        // 임계값 레이블 추가
+        std::stringstream ss;
+        ss << "Threshold (" << std::fixed << std::setprecision(2) << data->threshold << ")";
+        cv::putText(data->display_mat, 
+                   ss.str(),
+                   cv::Point(data->DISPLAY_WIDTH - 200, threshold_y - 10),  // 선 위에 텍스트 배치
+                   cv::FONT_HERSHEY_SIMPLEX, 
+                   0.6,  // 폰트 크기
+                   cv::Scalar(0, 0, 255),  // 빨간색 (선과 동일)
+                   2);
+        
+        // 확률값 그리기
+        if (!data->display_probs.empty()) {
+            for (size_t i = 1; i < data->display_probs.size(); ++i) {
+                int x1 = (i - 1) * data->DISPLAY_WIDTH / data->display_probs.size();
+                int x2 = i * data->DISPLAY_WIDTH / data->display_probs.size();
+                int y1 = prob_offset + prob_height * (1 - data->display_probs[i-1]);
+                int y2 = prob_offset + prob_height * (1 - data->display_probs[i]);
+                
+                cv::line(data->display_mat,
+                        cv::Point(x1, y1),
+                        cv::Point(x2, y2),
+                        cv::Scalar(0, 255, 0),  // 녹색
+                        2);
+            }
+        }
+        
+        // 텍스트 추가
+        cv::putText(data->display_mat, "Audio Waveform",
+                    cv::Point(10, 30),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                    cv::Scalar(255, 255, 255), 2);
+                    
+        cv::putText(data->display_mat, "Speech Probability",
+                    cv::Point(10, audio_height + 30),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                    cv::Scalar(255, 255, 255), 2);
+        
+        // 화면 표시
+        cv::imshow("Real-time VAD", data->display_mat);
+        data->should_update = false;  // 업데이트 완료
+    } catch (const cv::Exception& e) {
+        std::cerr << "OpenCV error: " << e.what() << std::endl;
+    }
+}
+
+// PortAudio 콜백 함수 수정
+static int audioCallback(const void* inputBuffer, void* outputBuffer,
+                        unsigned long framesPerBuffer,
+                        const PaStreamCallbackTimeInfo* timeInfo,
+                        PaStreamCallbackFlags statusFlags,
+                        void* userData) {
+    StreamData* data = (StreamData*)userData;
+    const float* in = (const float*)inputBuffer;
+    
+    if (!in) {
+        std::cerr << "No input buffer!" << std::endl;
+        return paContinue;
+    }
+    
+    std::vector<float> chunk(in, in + framesPerBuffer);
+    
+    {
+        std::lock_guard<std::mutex> lock(data->mtx);  // 뮤텍스 잠금
+        
+        data->vad->predict(chunk);
+        
+        // 디스플레이 버퍼 업데이트
+        data->display_audio.insert(data->display_audio.end(), chunk.begin(), chunk.end());
+        if (data->display_audio.size() > 16000 * 2) {
+            data->display_audio.erase(data->display_audio.begin(), 
+                                    data->display_audio.begin() + chunk.size());
+        }
+        
+        // VAD 확률 업데이트
+        float prob = data->vad->get_speech_probabilities().back();
+        data->display_probs.push_back(prob);
+        if (data->display_probs.size() > 200) {
+            data->display_probs.erase(data->display_probs.begin());
+        }
+        
+        data->should_update = true;  // 업데이트 필요 표시
+    }
+    
+    return paContinue;
+}
+
 int main() {
-    printf("Reading WAV file...\n");
-    const char* wav_path = "/Users/joonhyung-lee/etc/silero-vad/examples/cpp/sample.wav";
-    FILE* test_fp = fopen(wav_path, "rb");
-    if (test_fp == NULL) {
-        printf("Error: Cannot open file '%s'\n", wav_path);
-        printf("Error details: %s\n", strerror(errno));
-        return 1;
-    }
-    printf("WAV file opened successfully.\n");
-    fclose(test_fp);
-
-    printf("Creating WavReader...\n");
-    wav::WavReader wav_reader(wav_path);
-    
-    // Add error checking after WavReader creation
-    if (wav_reader.num_channel() <= 0) {
-        printf("Error: Failed to properly initialize WavReader\n");
+    // PortAudio 초기화
+    PaError err = Pa_Initialize();
+    if (err != paNoError) {
+        std::cerr << "PortAudio 초기화 실패: " << Pa_GetErrorText(err) << std::endl;
         return 1;
     }
     
-    printf("WavReader created successfully.\n");
-    int numSamples = wav_reader.num_samples();
-    std::vector<float> input_wav(static_cast<size_t>(numSamples));
-    for (size_t i = 0; i < static_cast<size_t>(numSamples); i++) {
-        input_wav[i] = static_cast<float>(*(wav_reader.data() + i));
-    }
-
-    // Set the ONNX model path (file located in the "model" folder).
+    // ONNX 모델 초기화
     std::string model_path = "./model/silero_vad.onnx";
-
-    // Initialize the VadIterator.
     VadIterator vad(model_path);
-
-    // Process the audio
-    vad.process(input_wav);
-
-    // Get the results
-    std::vector<timestamp_t> stamps = vad.get_speech_timestamps();
-    std::vector<float> probs = vad.get_speech_probabilities();
     
-    // Print timestamps
-    const float sample_rate_float = 16000.0f;
-    for (size_t i = 0; i < stamps.size(); i++) {
-        float start_sec = std::rint((stamps[i].start / sample_rate_float) * 10.0f) / 10.0f;
-        float end_sec = std::rint((stamps[i].end / sample_rate_float) * 10.0f) / 10.0f;
-        std::cout << "Speech detected from "
-            << std::fixed << std::setprecision(1) << start_sec
-            << " s to "
-            << std::fixed << std::setprecision(1) << end_sec
-            << " s" << std::endl;
+    // OpenCV 창 생성 및 확인
+    cv::namedWindow("Real-time VAD", cv::WINDOW_AUTOSIZE);
+    if (cv::getWindowProperty("Real-time VAD", cv::WND_PROP_VISIBLE) < 0) {
+        std::cerr << "OpenCV 창 생성 실패!" << std::endl;
+        Pa_Terminate();
+        return 1;
     }
-
-    // Visualize results
-    visualize_vad_results(input_wav, stamps, probs, vad.window_size_samples, 16000, vad.get_threshold());
-
+    std::cout << "OpenCV 창 생성 성공" << std::endl;
+    
+    // StreamData 초기화
+    StreamData data;
+    data.vad = &vad;
+    data.threshold = vad.get_threshold();
+    data.display_mat = cv::Mat::zeros(data.DISPLAY_HEIGHT, data.DISPLAY_WIDTH, CV_8UC3);
+    
+    // 입력 장치 정보 출력
+    int numDevices = Pa_GetDeviceCount();
+    std::cout << "사용 가능한 오디오 장치 수: " << numDevices << std::endl;
+    
+    const PaDeviceInfo* deviceInfo = Pa_GetDeviceInfo(Pa_GetDefaultInputDevice());
+    if (deviceInfo) {
+        std::cout << "기본 입력 장치: " << deviceInfo->name << std::endl;
+    }
+    
+    // 오디오 스트림 설정
+    PaStreamParameters inputParameters;
+    inputParameters.device = Pa_GetDefaultInputDevice();
+    if (inputParameters.device == paNoDevice) {
+        std::cerr << "입력 장치를 찾을 수 없습니다!" << std::endl;
+        Pa_Terminate();
+        return 1;
+    }
+    inputParameters.channelCount = 1;
+    inputParameters.sampleFormat = paFloat32;
+    inputParameters.suggestedLatency = deviceInfo->defaultLowInputLatency;
+    inputParameters.hostApiSpecificStreamInfo = nullptr;
+    
+    // stream 변수 선언 추가
+    PaStream* stream = nullptr;
+    
+    err = Pa_OpenStream(&stream,
+                       &inputParameters,
+                       nullptr,  // 출력 파라미터 없음
+                       16000,    // 샘플레이트
+                       512,      // 프레임 버퍼 크기
+                       paClipOff,// 클리핑 끄기
+                       audioCallback,
+                       &data);
+    
+    if (err != paNoError) {
+        std::cerr << "스트림 열기 실패: " << Pa_GetErrorText(err) << std::endl;
+        Pa_Terminate();
+        return 1;
+    }
+    
+    // 스트림 시작
+    err = Pa_StartStream(stream);
+    if (err != paNoError) {
+        std::cerr << "스트림 시작 실패: " << Pa_GetErrorText(err) << std::endl;
+        Pa_CloseStream(stream);
+        Pa_Terminate();
+        return 1;
+    }
+    
+    std::cout << "실시간 VAD 시작... 'q'를 누르면 종료됩니다." << std::endl;
+    
+    // 메인 루프 수정
+    while (true) {
+        updateDisplay(&data);  // 메인 스레드에서 디스플레이 업데이트
+        
+        char key = cv::waitKey(30);
+        if (key == 'q' || key == 'Q') {
+            break;
+        }
+        
+        if (cv::getWindowProperty("Real-time VAD", cv::WND_PROP_VISIBLE) < 1) {
+            break;
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    
+    // 정리
+    std::cout << "프로그램 종료 중..." << std::endl;
+    cv::destroyAllWindows();
+    Pa_StopStream(stream);
+    Pa_CloseStream(stream);
+    Pa_Terminate();
+    
     return 0;
 }
